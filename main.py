@@ -139,6 +139,7 @@ def user_id_from_claims(claims: dict) -> str:
 class CorrectionIn(BaseModel):
     site_host: str
     path: str
+    form_group: Optional[str] = None      # host+path; groups all tabs of one form
     field_fingerprint: str
     field_names: List[str] = []
     field_key: str
@@ -160,20 +161,25 @@ def post_correction(body: CorrectionIn, claims: dict = Depends(verify_jwt)):
             # 1) Upsert this user's vote. UNIQUE(fingerprint, field_key, user_id)
             #    means a repeat correction by the same user updates, never duplicates —
             #    so one person can't inflate the count.
+            # form_group falls back to host+path if the extension didn't send it,
+            # so it's always populated consistently.
+            fg = body.form_group or f"{body.site_host}{body.path}"
+
             cur.execute(
                 """
                 INSERT INTO recipe_corrections
-                    (id, site_host, path, field_fingerprint, field_key,
+                    (id, site_host, path, form_group, field_fingerprint, field_key,
                      filled_source_key, correct_source_key, action, user_id, match_type)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON DUPLICATE KEY UPDATE
                     correct_source_key = VALUES(correct_source_key),
                     filled_source_key  = VALUES(filled_source_key),
+                    form_group         = VALUES(form_group),
                     action             = VALUES(action),
                     match_type         = VALUES(match_type),
                     created_at         = CURRENT_TIMESTAMP
                 """,
-                (str(uuid.uuid4()), body.site_host, body.path, body.field_fingerprint,
+                (str(uuid.uuid4()), body.site_host, body.path, fg, body.field_fingerprint,
                  body.field_key, body.filled_source_key, body.correct_source_key,
                  body.action or "type", uid, body.match_type or "single"),
             )
@@ -201,18 +207,19 @@ def post_correction(body: CorrectionIn, claims: dict = Depends(verify_jwt)):
                 cur.execute(
                     """
                     INSERT INTO form_recipes
-                        (id, site_host, path, field_fingerprint, field_names,
+                        (id, site_host, path, form_group, field_fingerprint, field_names,
                          field_key, source_key, action, status, confirm_count, last_confirmed_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'confirmed',%s,CURRENT_TIMESTAMP)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'confirmed',%s,CURRENT_TIMESTAMP)
                     ON DUPLICATE KEY UPDATE
                         source_key        = VALUES(source_key),
                         field_names       = VALUES(field_names),
+                        form_group        = VALUES(form_group),
                         status            = 'confirmed',
                         confirm_count     = VALUES(confirm_count),
                         last_confirmed_at = CURRENT_TIMESTAMP,
                         updated_at        = CURRENT_TIMESTAMP
                     """,
-                    (str(uuid.uuid4()), body.site_host, body.path, body.field_fingerprint,
+                    (str(uuid.uuid4()), body.site_host, body.path, fg, body.field_fingerprint,
                      json.dumps(body.field_names or []), body.field_key,
                      top["correct_source_key"], body.action or "type", int(top["votes"])),
                 )
@@ -254,13 +261,17 @@ def get_rules(
             if not rows and FUZZY_ENABLED and field_names:
                 incoming = set(n for n in field_names.split(",") if n)
                 if incoming:
+                    # Filter to the SAME form family first (form_group = host+path),
+                    # then compare field-name sets within it. This keeps different tabs
+                    # of the same URL apart while tolerating fingerprint drift on one tab.
+                    fg = f"{site_host}{path}"
                     cur.execute(
                         """
                         SELECT field_key, source_key, field_names
                         FROM form_recipes
-                        WHERE site_host = %s AND path = %s AND status = 'confirmed'
+                        WHERE form_group = %s AND status = 'confirmed'
                         """,
-                        (site_host, path),
+                        (fg,),
                     )
                     candidates = cur.fetchall()
                     picked: Dict[str, str] = {}

@@ -58,6 +58,9 @@ JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() != "false"
 
 CONFIRM_THRESHOLD = int(os.environ.get("CONFIRM_THRESHOLD", "1") or 1)
+# Implicit ("user left the AI's value untouched") is a WEAKER signal than an active
+# correction, so it needs many more agreeing users. Separate, higher bar.
+IMPLICIT_THRESHOLD = int(os.environ.get("IMPLICIT_THRESHOLD", "5") or 5)
 FUZZY_ENABLED = os.environ.get("FUZZY_ENABLED", "false").lower() == "true"
 FUZZY_OVERLAP = float(os.environ.get("FUZZY_OVERLAP", "0.8") or 0.8)
 
@@ -147,6 +150,7 @@ class CorrectionIn(BaseModel):
     correct_source_key: str
     action: Optional[str] = "type"
     match_type: Optional[str] = "single"
+    signal_type: Optional[str] = "correction"   # 'correction' (strong) | 'implicit' (weak)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,46 +168,75 @@ def post_correction(body: CorrectionIn, claims: dict = Depends(verify_jwt)):
             # form_group falls back to host+path if the extension didn't send it,
             # so it's always populated consistently.
             fg = body.form_group or f"{body.site_host}{body.path}"
+            sig_type = (body.signal_type or "correction").lower()
+            if sig_type not in ("correction", "implicit"):
+                sig_type = "correction"
 
             cur.execute(
                 """
                 INSERT INTO recipe_corrections
                     (id, site_host, path, form_group, field_fingerprint, field_key,
-                     filled_source_key, correct_source_key, action, user_id, match_type)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     filled_source_key, correct_source_key, action, user_id, match_type, signal_type)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON DUPLICATE KEY UPDATE
                     correct_source_key = VALUES(correct_source_key),
                     filled_source_key  = VALUES(filled_source_key),
                     form_group         = VALUES(form_group),
                     action             = VALUES(action),
                     match_type         = VALUES(match_type),
+                    signal_type        = VALUES(signal_type),
                     created_at         = CURRENT_TIMESTAMP
                 """,
                 (str(uuid.uuid4()), body.site_host, body.path, fg, body.field_fingerprint,
                  body.field_key, body.filled_source_key, body.correct_source_key,
-                 body.action or "type", uid, body.match_type or "single"),
+                 body.action or "type", uid, body.match_type or "single", sig_type),
             )
 
-            # 2) Count DISTINCT non-test users who agree on the SAME correct_source_key
-            #    for this exact field on this exact form.
+            # 2) Decide if this field now has a confirmable rule. Corrections and
+            #    implicit votes are counted in SEPARATE buckets with DIFFERENT bars:
+            #      - corrections (strong)  -> CONFIRM_THRESHOLD  (e.g. 1)
+            #      - implicit  (weak)      -> IMPLICIT_THRESHOLD (e.g. 5)
+            #    A CORRECTION ALWAYS WINS over implicit: if any correction bucket meets
+            #    its bar, it decides the rule and any implicit-derived rule is overwritten.
+            #    Silence never beats an active correction.
             cur.execute(
                 """
-                SELECT correct_source_key, COUNT(DISTINCT user_id) AS votes
+                SELECT correct_source_key, signal_type,
+                       COUNT(DISTINCT user_id) AS votes
                 FROM recipe_corrections
                 WHERE field_fingerprint = %s
                   AND field_key = %s
                   AND is_test_account = 0
-                GROUP BY correct_source_key
-                ORDER BY votes DESC
-                LIMIT 1
+                GROUP BY correct_source_key, signal_type
                 """,
                 (body.field_fingerprint, body.field_key),
             )
-            top = cur.fetchone()
+            rows = cur.fetchall()
+
+            # Find the best correction candidate and the best implicit candidate.
+            best_corr = None   # (key, votes)
+            best_impl = None
+            for r in rows:
+                key, st, votes = r["correct_source_key"], r["signal_type"], int(r["votes"])
+                if st == "correction":
+                    if not best_corr or votes > best_corr[1]:
+                        best_corr = (key, votes)
+                else:
+                    if not best_impl or votes > best_impl[1]:
+                        best_impl = (key, votes)
+
+            # Correction wins if it meets its (low) bar; else implicit if it meets its
+            # (high) bar. This ordering is what makes a correction override silence.
+            chosen_key = None
+            chosen_votes = 0
+            chosen_via = None
+            if best_corr and best_corr[1] >= CONFIRM_THRESHOLD:
+                chosen_key, chosen_votes, chosen_via = best_corr[0], best_corr[1], "correction"
+            elif best_impl and best_impl[1] >= IMPLICIT_THRESHOLD:
+                chosen_key, chosen_votes, chosen_via = best_impl[0], best_impl[1], "implicit"
 
             promoted = False
-            if top and top["votes"] >= CONFIRM_THRESHOLD:
-                # 3) Enough agreement -> confirm the rule (upsert into form_recipes).
+            if chosen_key:
                 cur.execute(
                     """
                     INSERT INTO form_recipes
@@ -221,11 +254,11 @@ def post_correction(body: CorrectionIn, claims: dict = Depends(verify_jwt)):
                     """,
                     (str(uuid.uuid4()), body.site_host, body.path, fg, body.field_fingerprint,
                      json.dumps(body.field_names or []), body.field_key,
-                     top["correct_source_key"], body.action or "type", int(top["votes"])),
+                     chosen_key, body.action or "type", int(chosen_votes)),
                 )
                 promoted = True
 
-        return {"success": True, "promoted": promoted}
+        return {"success": True, "promoted": promoted, "via": chosen_via}
     finally:
         conn.close()
 
@@ -320,5 +353,6 @@ def debug():
         "db_connected": db_ok,
         "db_error": err,
         "confirm_threshold": CONFIRM_THRESHOLD,
+        "implicit_threshold": IMPLICIT_THRESHOLD,
         "fuzzy_enabled": FUZZY_ENABLED,
     }
